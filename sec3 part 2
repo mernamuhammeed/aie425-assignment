@@ -1,0 +1,531 @@
+
+
+
+#!/usr/bin/env python3
+"
+
+
+import math
+import random
+from collections import defaultdict
+import matplotlib.pyplot as plt
+
+import pandas as pd
+
+
+
+RATINGS_PATH = r"C:\Users\Start\Downloads\ml-20m\ml-20m\ratings.csv"
+# For MovieLens 20M we use CSV (comma-separated), not '::'
+IS_DAT = False  # False for MovieLens 20M ratings.csv (userId,movieId,rating,timestamp)
+
+MIN_RATINGS_PER_USER = 100   # keep only active users
+NUM_USERS_SUBSET = 1000      # sample this many users from the active ones
+
+K_VALUES = [5, 10, 15, 20, 30, 50]
+MAX_KMEANS_ITERS = 30
+RANDOM_SEED = 42
+
+
+
+
+def mean(values):
+    if not values:
+        return 0.0
+    total = 0.0
+    for v in values:
+        total += v
+    return total / float(len(values))
+
+
+def std_dev(values):
+    if not values:
+        return 0.0
+    m = mean(values)
+    accum = 0.0
+    for v in values:
+        diff = v - m
+        accum += diff * diff
+    return math.sqrt(accum / float(len(values)))
+
+
+def euclidean_distance(vec1, vec2):
+    """Euclidean distance between two 3D vectors."""
+    diff0 = vec1[0] - vec2[0]
+    diff1 = vec1[1] - vec2[1]
+    diff2 = vec1[2] - vec2[2]
+    return math.sqrt(diff0 * diff0 + diff1 * diff1 + diff2 * diff2)
+
+
+def euclidean_distance_sq(vec1, vec2):
+    """Squared Euclidean distance (no sqrt)."""
+    diff0 = vec1[0] - vec2[0]
+    diff1 = vec1[1] - vec2[1]
+    diff2 = vec1[2] - vec2[2]
+    return diff0 * diff0 + diff1 * diff1 + diff2 * diff2
+
+
+# ============================================================
+# STEP 0: LOAD RATINGS & BUILD USER–ITEM STRUCTURES
+# ============================================================
+
+def load_ratings(path, is_dat=True):
+    if is_dat:
+        df = pd.read_csv(
+            path,
+            sep="::",
+            engine="python",
+            header=None,
+            names=["userId", "movieId", "rating", "timestamp"],
+        )
+    else:
+        # MovieLens 20M ratings.csv: header = userId,movieId,rating,timestamp
+        df = pd.read_csv(path)
+    df["rating"] = df["rating"].astype(float)
+    return df
+
+
+def build_user_item_structures(df):
+    """
+    - filter users with at least MIN_RATINGS_PER_USER ratings
+    - optionally sample NUM_USERS_SUBSET of them
+    - build user_ratings: user -> {item: rating}
+    """
+    # count ratings per user
+    counts = df["userId"].value_counts()
+    print("Total users in raw df:", len(counts))
+
+    active_users = [u for u, c in counts.items() if c >= MIN_RATINGS_PER_USER]
+    print("Users with ≥", MIN_RATINGS_PER_USER, "ratings:", len(active_users))
+
+    # restrict to active users
+    df = df[df["userId"].isin(active_users)].copy()
+
+    # sample subset of users if needed
+    if NUM_USERS_SUBSET is not None and NUM_USERS_SUBSET < len(active_users):
+        random.seed(RANDOM_SEED)
+        sampled_users = random.sample(active_users, NUM_USERS_SUBSET)
+        df = df[df["userId"].isin(sampled_users)].copy()
+    else:
+        sampled_users = active_users
+
+    users = sorted(df["userId"].unique().tolist())
+
+    user_ratings = defaultdict(dict)
+    for row in df.itertuples(index=False):
+        u = int(row.userId)
+        i = int(row.movieId)
+        r = float(row.rating)
+        user_ratings[u][i] = r
+
+    print("Users in subset:", len(users))
+    print("Items in subset:", df["movieId"].nunique())
+    print("Ratings in subset:", len(df))
+
+    return users, user_ratings
+
+
+# ============================================================
+# STEP 1: CO-RATING STATISTICS PER USER
+# ============================================================
+
+def compute_common_counts(users, user_ratings):
+    """
+    For each pair of users (u, v) compute number of common rated items.
+    Returns:
+        common_counts: dict of dicts -> common_counts[u][v] = n_common(u,v)
+    """
+    # prebuild user -> set(items)
+    user_items = {}
+    for u in users:
+        user_items[u] = set(user_ratings[u].keys())
+
+    common_counts = {u: {} for u in users}
+
+    n_users = len(users)
+    for i in range(n_users):
+        u = users[i]
+        items_u = user_items[u]
+        for j in range(i + 1, n_users):
+            v = users[j]
+            items_v = user_items[v]
+            # intersection size (manual)
+            count = 0
+            # iterate over smaller set
+            if len(items_u) < len(items_v):
+                smaller, bigger = items_u, items_v
+            else:
+                smaller, bigger = items_v, items_u
+            for it in smaller:
+                if it in bigger:
+                    count += 1
+
+            common_counts[u][v] = count
+            common_counts[v][u] = count
+
+    return common_counts
+
+
+def compute_user_features(users, common_counts):
+    """
+    For each user u, compute:
+      - avg_common[u]
+      - max_common[u]
+      - min_common[u] (excluding zeros; 0 if no positive common count)
+      - feature vector f[u] = [avg, max, min]
+    """
+    avg_common = {}
+    max_common = {}
+    min_common = {}
+    features = {}
+
+    for u in users:
+        counts = []
+        for v, c in common_counts[u].items():
+            counts.append(c)
+
+        if not counts:
+            avg_val = 0.0
+            max_val = 0.0
+            min_val = 0.0
+        else:
+            # average over all other users
+            avg_val = mean(counts)
+            # max
+            max_val = 0
+            for c in counts:
+                if c > max_val:
+                    max_val = c
+            # min positive (exclude zeros)
+            min_pos = None
+            for c in counts:
+                if c > 0 and (min_pos is None or c < min_pos):
+                    min_pos = c
+            if min_pos is None:
+                min_val = 0.0
+            else:
+                min_val = float(min_pos)
+
+        avg_common[u] = float(avg_val)
+        max_common[u] = float(max_val)
+        min_common[u] = float(min_val)
+        features[u] = [avg_common[u], max_common[u], min_common[u]]
+
+    return avg_common, max_common, min_common, features
+
+
+# ============================================================
+# STEP 2: Z-SCORE NORMALIZATION
+# ============================================================
+
+def normalize_features(users, features):
+    """
+    Input:
+        features[u] = [f1, f2, f3]
+    Output:
+        norm_features[u] = [z1, z2, z3]
+        plus per-dimension mean & std
+    """
+    f1_vals = []
+    f2_vals = []
+    f3_vals = []
+    for u in users:
+        f1, f2, f3 = features[u]
+        f1_vals.append(f1)
+        f2_vals.append(f2)
+        f3_vals.append(f3)
+
+    mu1 = mean(f1_vals)
+    mu2 = mean(f2_vals)
+    mu3 = mean(f3_vals)
+    sd1 = std_dev(f1_vals)
+    sd2 = std_dev(f2_vals)
+    sd3 = std_dev(f3_vals)
+
+    # avoid division by zero
+    if sd1 == 0.0:
+        sd1 = 1.0
+    if sd2 == 0.0:
+        sd2 = 1.0
+    if sd3 == 0.0:
+        sd3 = 1.0
+
+    norm_features = {}
+    for u in users:
+        f1, f2, f3 = features[u]
+        z1 = (f1 - mu1) / sd1
+        z2 = (f2 - mu2) / sd2
+        z3 = (f3 - mu3) / sd3
+        norm_features[u] = [z1, z2, z3]
+
+    print("\nFeature means:", mu1, mu2, mu3)
+    print("Feature stds :", sd1, sd2, sd3)
+
+    return norm_features, (mu1, mu2, mu3), (sd1, sd2, sd3)
+
+
+# ============================================================
+# STEP 3: K-MEANS CLUSTERING (manual)
+# ============================================================
+
+def kmeans(users, norm_features, K, max_iters=30):
+    """
+    Manual K-means on 3D normalized features.
+    Returns:
+        assignments: dict user -> cluster_id
+        centroids: list of 3D vectors
+    """
+    random.seed(RANDOM_SEED + K)
+
+    # ----- initialization: random K users as centroids -----
+    if K > len(users):
+        raise ValueError("K is larger than number of users!")
+
+    initial_users = random.sample(users, K)
+    centroids = []
+    for u in initial_users:
+        centroids.append(list(norm_features[u]))  # copy
+
+    assignments = {u: -1 for u in users}
+
+    for it in range(max_iters):
+        changed = False
+
+        # ----- assignment step -----
+        for u in users:
+            vec = norm_features[u]
+            best_k = None
+            best_dist = None
+            for k in range(K):
+                d = euclidean_distance_sq(vec, centroids[k])
+                if best_k is None or d < best_dist:
+                    best_k = k
+                    best_dist = d
+            if assignments[u] != best_k:
+                assignments[u] = best_k
+                changed = True
+
+        # ----- update step -----
+        # prepare accumulators
+        sums = [[0.0, 0.0, 0.0] for _ in range(K)]
+        counts = [0 for _ in range(K)]
+
+        for u in users:
+            k = assignments[u]
+            vec = norm_features[u]
+            sums[k][0] += vec[0]
+            sums[k][1] += vec[1]
+            sums[k][2] += vec[2]
+            counts[k] += 1
+
+        for k in range(K):
+            if counts[k] == 0:
+                # empty cluster -> reinit randomly
+                r_user = random.choice(users)
+                centroids[k] = list(norm_features[r_user])
+            else:
+                centroids[k][0] = sums[k][0] / float(counts[k])
+                centroids[k][1] = sums[k][1] / float(counts[k])
+                centroids[k][2] = sums[k][2] / float(counts[k])
+
+        if not changed:
+            # converged
+            break
+
+    return assignments, centroids
+
+
+# ============================================================
+# WCSS & SILHOUETTE
+# ============================================================
+
+def compute_wcss(users, norm_features, assignments, centroids):
+    wcss = 0.0
+    for u in users:
+        k = assignments[u]
+        vec = norm_features[u]
+        c = centroids[k]
+        wcss += euclidean_distance_sq(vec, c)
+    return wcss
+
+
+def precompute_pairwise_distances(users, norm_features):
+    """
+    Precompute Euclidean distances between all pairs of users.
+    Returns:
+        dist[(u,v)] = distance between u and v
+    """
+    dist = {}
+    n = len(users)
+    for i in range(n):
+        u = users[i]
+        vu = norm_features[u]
+        for j in range(i + 1, n):
+            v = users[j]
+            vv = norm_features[v]
+            d = euclidean_distance(vu, vv)
+            dist[(u, v)] = d
+            dist[(v, u)] = d
+        dist[(u, u)] = 0.0
+    return dist
+
+
+def silhouette_score(users, assignments, dist):
+    """
+    Manual silhouette score:
+        s(u) = (b(u) - a(u)) / max(a(u), b(u))
+    where:
+        a(u) = mean distance to same-cluster points
+        b(u) = min over other clusters of mean distance to that cluster
+    """
+    # build cluster -> list of users
+    clusters = defaultdict(list)
+    for u in users:
+        k = assignments[u]
+        clusters[k].append(u)
+
+    s_values = []
+    for u in users:
+        k_u = assignments[u]
+        same_cluster = clusters[k_u]
+        # a(u): average dist to same cluster
+        if len(same_cluster) <= 1:
+            a_u = 0.0
+        else:
+            total = 0.0
+            cnt = 0
+            for v in same_cluster:
+                if v == u:
+                    continue
+                total += dist[(u, v)]
+                cnt += 1
+            a_u = total / float(cnt) if cnt > 0 else 0.0
+
+        # b(u): best (smallest) average distance to other clusters
+        b_u = None
+        for k_other, members in clusters.items():
+            if k_other == k_u or len(members) == 0:
+                continue
+            total = 0.0
+            cnt = 0
+            for v in members:
+                total += dist[(u, v)]
+                cnt += 1
+            avg_d = total / float(cnt) if cnt > 0 else 0.0
+            if b_u is None or avg_d < b_u:
+                b_u = avg_d
+
+        if b_u is None:
+            s_u = 0.0
+        else:
+            denom = max(a_u, b_u)
+            if denom == 0.0:
+                s_u = 0.0
+            else:
+                s_u = (b_u - a_u) / denom
+
+        s_values.append(s_u)
+
+    return mean(s_values) if s_values else 0.0
+
+
+# ============================================================
+# MAIN FLOW
+# ============================================================
+
+def main():
+    print("Loading ratings...")
+    df = load_ratings(RATINGS_PATH, is_dat=IS_DAT)
+
+    # Debug: check that ratings are actually loaded
+    print("DataFrame shape:", df.shape)
+    print("Columns:", df.columns.tolist()[:10])
+    print(df.head())
+
+    print("Building user-item structures...")
+    users, user_ratings = build_user_item_structures(df)
+
+    print("\nComputing common rating counts between users...")
+    common_counts = compute_common_counts(users, user_ratings)
+
+    print("Computing user features (avg/max/min common)...")
+    avg_common, max_common, min_common, features = compute_user_features(users, common_counts)
+
+    print("Normalizing features with Z-score...")
+    norm_features, mu, sig = normalize_features(users, features)
+
+    print("\nPrecomputing pairwise distances between normalized feature vectors...")
+    dist = precompute_pairwise_distances(users, norm_features)
+
+    # ----- run K-means for each K -----
+    results = []  # list of (K, wcss, silhouette)
+    assignments_per_K = {}
+    centroids_per_K = {}
+
+    print("\nRunning K-means for different K values...")
+    for K in K_VALUES:
+        print(f"\n=== K = {K} ===")
+        assignments, centroids = kmeans(users, norm_features, K, max_iters=MAX_KMEANS_ITERS)
+        wcss = compute_wcss(users, norm_features, assignments, centroids)
+        sil = silhouette_score(users, assignments, dist)
+        print(f"WCSS(K={K}) = {wcss:.3f}")
+        print(f"Silhouette(K={K}) = {sil:.4f}")
+
+        results.append((K, wcss, sil))
+        assignments_per_K[K] = assignments
+        centroids_per_K[K] = centroids
+
+    # ----- print summary table -----
+    print("\nSummary of K, WCSS and Silhouette:")
+    for K, wcss, sil in results:
+        print(f"K={K:2d}  WCSS={wcss:.3f}  Silhouette={sil:.4f}")
+
+    # ----- choose optimal K: highest silhouette -----
+    best_K = None
+    best_sil = None
+    for K, wcss, sil in results:
+        if best_K is None or sil > best_sil:
+            best_K = K
+            best_sil = sil
+
+    print(f"\nChosen optimal K based on highest silhouette: K={best_K} (silhouette={best_sil:.4f})")
+
+    # ----- cluster statistics for optimal K -----
+    print(f"\nCluster statistics for K={best_K}:")
+    assignments = assignments_per_K[best_K]
+
+    clusters = defaultdict(list)
+    for u in users:
+        clusters[assignments[u]].append(u)
+
+    for k, members in clusters.items():
+        size = len(members)
+        avg_vals = []
+        max_vals = []
+        min_vals = []
+        for u in members:
+            avg_vals.append(avg_common[u])
+            max_vals.append(max_common[u])
+            min_vals.append(min_common[u])
+
+        mean_avg = mean(avg_vals)
+        mean_max = mean(max_vals)
+        mean_min = mean(min_vals)
+
+        print(
+            f"Cluster {k}: size={size}, "
+            f"avg(avg_common)={mean_avg:.2f}, "
+            f"avg(max_common)={mean_max:.2f}, "
+            f"avg(min_common)={mean_min:.2f}"
+        )
+
+    print("\nDone. Use the printed tables and cluster stats in your report.")
+
+
+if __name__ == "__main__":
+    main()
+
+ 
+
+
+
+
