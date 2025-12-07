@@ -1,0 +1,156 @@
+# ==============================
+# Section 3 Part 4: Cold-Start Users/Items + K-Means Clustering
+# ==============================
+
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from scipy.sparse import csr_matrix
+
+# --------------------------
+# 1. Load Dataset
+# --------------------------
+ratings = pd.read_csv(r"C:/Users/Start/Downloads/ml-20m/ml-20m/ratings.csv")
+print(f"Ratings dataset loaded: {ratings.shape}")
+
+# Optional: subset first 5000 users for faster testing
+subset_users = ratings['userId'].unique()[:5000]
+ratings_subset = ratings[ratings['userId'].isin(subset_users)].copy()
+print(f"Subset dataset shape: {ratings_subset.shape}")
+
+# Map IDs to consecutive indices
+user_mapper = {id: i for i, id in enumerate(ratings_subset['userId'].unique())}
+movie_mapper = {id: i for i, id in enumerate(ratings_subset['movieId'].unique())}
+ratings_subset['user_idx'] = ratings_subset['userId'].map(user_mapper)
+ratings_subset['movie_idx'] = ratings_subset['movieId'].map(movie_mapper)
+
+num_users = len(user_mapper)
+num_movies = len(movie_mapper)
+print(f"Number of users: {num_users}, Number of movies: {num_movies}")
+
+# Build sparse user-item matrix
+rows = ratings_subset['user_idx'].values
+cols = ratings_subset['movie_idx'].values
+data = ratings_subset['rating'].values
+user_item_matrix = csr_matrix((data, (rows, cols)), shape=(num_users, num_movies))
+
+# --------------------------
+# 2. Simulate Cold-Start Users/Items
+# --------------------------
+np.random.seed(42)
+cold_users = np.random.choice(np.where((user_item_matrix != 0).sum(axis=1).A1 > 50)[0], 100, replace=False)
+cold_items = np.random.choice(np.where((user_item_matrix != 0).sum(axis=0).A1 > 50)[0], 50, replace=False)
+
+hidden_ratings_users = {}
+for u in cold_users:
+    rated_idx = user_item_matrix[u,:].nonzero()[1]
+    hide_idx = np.random.choice(rated_idx, int(0.8*len(rated_idx)), replace=False)
+    hidden_ratings_users[u] = user_item_matrix[u, hide_idx].toarray().flatten()
+    user_item_matrix[u, hide_idx] = 0
+
+hidden_ratings_items = {}
+for i in cold_items:
+    rated_idx = user_item_matrix[:,i].nonzero()[0]
+    hide_idx = np.random.choice(rated_idx, int(0.8*len(rated_idx)), replace=False)
+    hidden_ratings_items[i] = user_item_matrix[hide_idx, i].toarray().flatten()
+    user_item_matrix[hide_idx, i] = 0
+
+print(f"Simulated cold-start for {len(cold_users)} users and {len(cold_items)} items.")
+
+# --------------------------
+# 3. K-Means Clustering for Users
+# --------------------------
+user_features = np.array(user_item_matrix.mean(axis=1)).reshape(-1,1)
+K = 10
+kmeans_users = KMeans(n_clusters=K, random_state=42, n_init=10).fit(user_features)
+user_clusters = kmeans_users.labels_
+cluster_centroids = kmeans_users.cluster_centers_
+
+# Assign cold-start users to clusters
+cold_user_assignment = {}
+cold_user_confidence = {}
+for u in cold_users:
+    feature = np.array(user_item_matrix[u,:].mean()).reshape(1,-1)
+    distances = np.linalg.norm(cluster_centroids - feature, axis=1)
+    nearest = np.argmin(distances)
+    second = np.argsort(distances)[1]
+    confidence = (distances[second]-distances[nearest])/distances[second]
+    cold_user_assignment[u] = nearest
+    cold_user_confidence[u] = confidence
+
+print("Sample cold-start user assignments (user_idx: cluster, confidence):")
+for u in list(cold_users[:5]):
+    print(u, cold_user_assignment[u], f"{cold_user_confidence[u]:.3f}")
+
+# --------------------------
+# 4. Predict Ratings for Cold-Start Users
+# --------------------------
+def predict_for_user(u):
+    cluster_id = cold_user_assignment[u]
+    cluster_users = np.where(user_clusters == cluster_id)[0]
+    sims = cosine_similarity(user_item_matrix[u,:].toarray(), user_item_matrix[cluster_users,:].toarray())[0]
+    pred = np.zeros(user_item_matrix.shape[1])
+    
+    for i in range(user_item_matrix.shape[1]):
+        mask = user_item_matrix[cluster_users,i].toarray().flatten() > 0
+        if np.any(mask):
+            sim_sum = sims[mask].sum()
+            if sim_sum > 0:
+                pred[i] = np.dot(user_item_matrix[cluster_users,i].toarray().flatten()[mask], sims[mask]) / sim_sum
+            else:
+                pred[i] = cluster_centroids[cluster_id][0]
+        else:
+            pred[i] = cluster_centroids[cluster_id][0]
+    
+    # Replace any NaN values safely
+    pred = np.nan_to_num(pred, nan=cluster_centroids[cluster_id][0])
+    return pred
+
+cold_user_preds = {u: predict_for_user(u) for u in cold_users}
+
+# --------------------------
+# 5. Evaluate Predictions
+# --------------------------
+def evaluate(preds, hidden_ratings):
+    mae_list, rmse_list, precision_list, recall_list = [], [], [], []
+    for u, pred_ratings in preds.items():
+        true_ratings = hidden_ratings[u]
+        rated_idx = np.where(true_ratings > 0)[0]
+        if len(rated_idx) == 0:
+            continue
+        mae_list.append(mean_absolute_error(true_ratings[rated_idx], pred_ratings[rated_idx]))
+        rmse_list.append(np.sqrt(mean_squared_error(true_ratings[rated_idx], pred_ratings[rated_idx])))
+        top10 = np.argsort(pred_ratings)[-10:]
+        precision = len(set(top10).intersection(set(rated_idx))) / 10
+        recall = len(set(top10).intersection(set(rated_idx))) / len(rated_idx)
+        precision_list.append(precision)
+        recall_list.append(recall)
+    return np.mean(mae_list), np.mean(rmse_list), np.mean(precision_list), np.mean(recall_list)
+
+mae, rmse, prec, rec = evaluate(cold_user_preds, hidden_ratings_users)
+print(f"Cold-Start User Evaluation - MAE: {mae:.4f}, RMSE: {rmse:.4f}, Precision@10: {prec:.4f}, Recall@10: {rec:.4f}")
+
+# --------------------------
+# 6. K-Means Clustering for Items
+# --------------------------
+item_features = np.array(user_item_matrix.mean(axis=0)).reshape(-1,1)
+kmeans_items = KMeans(n_clusters=K, random_state=42, n_init=10).fit(item_features)
+item_clusters = kmeans_items.labels_
+item_centroids = kmeans_items.cluster_centers_
+
+cold_item_assignment = {}
+cold_item_confidence = {}
+for i in cold_items:
+    feature = np.array(user_item_matrix[:,i].mean()).reshape(1,-1)
+    distances = np.linalg.norm(item_centroids - feature, axis=1)
+    nearest = np.argmin(distances)
+    second = np.argsort(distances)[1]
+    confidence = (distances[second]-distances[nearest])/distances[second]
+    cold_item_assignment[i] = nearest
+    cold_item_confidence[i] = confidence
+
+print("Sample cold-start item assignments (item_idx: cluster, confidence):")
+for i in list(cold_items[:5]):
+    print(i, cold_item_assignment[i], f"{cold_item_confidence[i]:.3f}")
