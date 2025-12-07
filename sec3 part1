@@ -1,0 +1,74 @@
+# ------------------------------
+# Section 3 - Part 1: Baseline CF (User-based Mean-Centered Cosine)
+# ------------------------------
+
+import numpy as np
+from collections import defaultdict
+
+# Ensure required variables exist
+required_vars_p1 = ['target_users', 'target_items', 'user_item_matrix', 'rq', 'nq', 'beta']
+missing_vars_p1 = [v for v in required_vars_p1 if v not in globals()]
+if missing_vars_p1:
+    raise ValueError(f"Missing variables for Section 3 Part 1: {missing_vars_p1}")
+
+def mean_centered_cosine(u1, u2, user_item_dict, user_means, min_overlap=5):
+    """Compute mean-centered cosine similarity for two users."""
+    items_u1 = set(user_item_dict[u1].keys())
+    items_u2 = set(user_item_dict[u2].keys())
+    common_items = items_u1 & items_u2
+    if len(common_items) < min_overlap:
+        return 0.0
+    mean1, mean2 = user_means[u1], user_means[u2]
+    numerator = sum((user_item_dict[u1][i]-mean1)*(user_item_dict[u2][i]-mean2) for i in common_items)
+    denominator = np.sqrt(sum((user_item_dict[u1][i]-mean1)**2 for i in common_items)) * \
+                  np.sqrt(sum((user_item_dict[u2][i]-mean2)**2 for i in common_items))
+    return numerator/denominator if denominator != 0 else 0.0
+
+# Predictions dictionary
+predictions_part1 = {}
+top_20_neighbors_MC_part1 = {}
+top_20_neighbors_DS_part1 = {}
+
+for target_user in target_users:
+    # Compute similarities with all other users
+    sims = []
+    for other_user in user_item_matrix:
+        if other_user == target_user:
+            continue
+        sim = mean_centered_cosine(target_user, other_user, user_item_matrix, rq)
+        if sim > 0:
+            sims.append((other_user, sim))
+    sims.sort(key=lambda x: x[1], reverse=True)
+
+    # Select top 20% based on MC similarity
+    k_MC = max(1, int(0.2*len(sims)))
+    top_MC = sims[:k_MC]
+    top_20_neighbors_MC_part1[target_user] = top_MC
+
+    # Apply Discount Factor (DS) using beta threshold (30% of target_user's items)
+    DS_list = []
+    for other_user, sim_score in top_MC:
+        shared_count = len(set(user_item_matrix[target_user].keys()) & set(user_item_matrix[other_user].keys()))
+        DF = min(1.0, shared_count / (0.3 * nq[target_user])) if nq[target_user] > 0 else 1.0
+        DS_list.append((other_user, sim_score*DF))
+    DS_list.sort(key=lambda x: x[1], reverse=True)
+
+    k_DS = max(1, int(0.2*len(DS_list)))
+    top_DS = DS_list[:k_DS]
+    top_20_neighbors_DS_part1[target_user] = top_DS
+
+    # Predict ratings for target items
+    unrated_items = set()
+    for uid, _ in top_DS:
+        unrated_items.update(user_item_matrix[uid].keys())
+    unrated_items -= set(user_item_matrix[target_user].keys())
+
+    preds = {}
+    mean_target = rq[target_user]
+    for item in unrated_items:
+        numerator = sum(DS*(user_item_matrix[uid][item]-rq[uid]) for uid, DS in top_DS if item in user_item_matrix[uid])
+        denom = sum(abs(DS) for uid, DS in top_DS if item in user_item_matrix[uid])
+        preds[item] = mean_target + numerator/denom if denom>0 else mean_target
+    predictions_part1[target_user] = preds
+
+print("Section 3 Part 1: Baseline CF predictions completed.")
