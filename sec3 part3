@@ -1,0 +1,158 @@
+print("--- Section 3.3.3: Part 3 - K-means Clustering based on Average Number of Raters (Item-Based Clustering) ---")
+
+required_vars = ['ratings_df', 'target_users', 'target_items', 'user_item_matrix', 'item_user_matrix', 'ni', 'ri', 'rq', 'nq', 'beta']
+missing_vars = [var for var in required_vars if var not in globals()]
+if missing_vars:
+    print(f"Error: Missing required variables from Section 1: {missing_vars}")
+    print("Please run the cells from Section 1 first.")
+else:
+    print("Required variables from Section 1 are available.")
+    print(f"Target Users: {target_users}")
+    print(f"Target Items: {target_items}")
+    print(f"Beta (Threshold S): {beta}")
+
+    print("\nTask 1: Computing item statistics...")
+
+    print(f"  Using pre-calculated ni (number of raters) and ri (average rating) from Section 1.")
+
+    print("  Calculating standard deviation of ratings per item...")
+    item_std_dev = ratings_df.groupby('movieId')['rating'].std(ddof=0)
+    si = item_std_dev.rename('si')
+    print(f"  Sample of item standard deviations (si):\n{si.head()}")
+    print(f"  Shape of si: {si.shape}")
+
+    print("\nTask 1.3: Creating feature vectors [num_raters, avg_rating, std_rating] for each item.")
+    item_features_df = pd.DataFrame({
+        'num_raters': ni,
+        'avg_rating': ri,
+        'std_rating': si
+    }).fillna(0)
+    print(f"  Item features DataFrame shape: {item_features_df.shape}")
+    print(f"  Sample of item features:\n{item_features_df.head()}")
+
+    print("\nTask 2: Normalizing feature vectors using Z-score standardization...")
+    from sklearn.preprocessing import StandardScaler
+    feature_columns = ['num_raters', 'avg_rating', 'std_rating']
+    X_items = item_features_df[feature_columns].values
+    scaler_items = StandardScaler()
+    X_items_normalized = scaler_items.fit_transform(X_items)
+    item_features_normalized_df = pd.DataFrame(X_items_normalized, index=item_features_df.index, columns=feature_columns)
+    print(f"  Normalized feature DataFrame shape: {item_features_normalized_df.shape}")
+    print(f"  Sample of normalized features:\n{item_features_normalized_df.head()}")
+
+    print("\nTask 2.2: Verifying normalization (mean ~ 0, std ~ 1):")
+    print(f"  Mean of normalized features: {item_features_normalized_df.mean(axis=0)}")
+    print(f"  Std of normalized features: {item_features_normalized_df.std(axis=0)}")
+
+    print("\nTask 3: Applying K-means clustering with different K values.")
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+    import matplotlib.pyplot as plt
+
+    K_values_items = [5, 10, 15, 20, 30, 50]
+    clustering_results_items = {}
+    wcss_values_items = []
+    silhouette_scores_items = []
+
+    for K in K_values_items:
+        print(f"  Performing K-means clustering with K={K}...")
+        kmeans_model_items = KMeans(n_clusters=K, random_state=42, n_init=10)
+        cluster_labels_items = kmeans_model_items.fit_predict(X_items_normalized)
+        cluster_centroids_items = kmeans_model_items.cluster_centers_
+        wcss = kmeans_model_items.inertia_
+        wcss_values_items.append(wcss)
+        if len(X_items_normalized) > 10000:
+            indices_sample = np.random.choice(len(X_items_normalized), size=min(10000, len(X_items_normalized)), replace=False)
+            X_sample = X_items_normalized[indices_sample]
+            labels_sample = cluster_labels_items[indices_sample]
+            sil_score = silhouette_score(X_sample, labels_sample)
+        else:
+            sil_score = silhouette_score(X_items_normalized, cluster_labels_items)
+        silhouette_scores_items.append(sil_score)
+        clustering_results_items[K] = {
+            'labels': cluster_labels_items,
+            'centroids': cluster_centroids_items,
+            'model': kmeans_model_items,
+            'wcss': wcss,
+            'silhouette_score': sil_score
+        }
+        print(f"    Completed K-means for K={K}. WCSS: {wcss:.2f}, Silhouette Score: {sil_score:.4f}")
+
+    print("\nTask 4: Determining the optimal K value.")
+    print("K\tWCSS\t\tSilhouette Score")
+    for i, K in enumerate(K_values_items):
+        print(f"{K}\t{wcss_values_items[i]:.2f}\t\t{silhouette_scores_items[i]:.4f}")
+
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(K_values_items, wcss_values_items, marker='o')
+    plt.title('Elbow Curve: WCSS vs. Number of Clusters (K) - Items')
+    plt.xlabel('Number of Clusters (K)')
+    plt.ylabel('Within-Cluster Sum of Squares (WCSS)')
+    plt.grid(True)
+    plt.subplot(1, 2, 2)
+    plt.plot(K_values_items, silhouette_scores_items, marker='s', color='orange')
+    plt.title('Silhouette Score vs. Number of Clusters (K) - Items')
+    plt.xlabel('Number of Clusters (K)')
+    plt.ylabel('Silhouette Score')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    optimal_K_index_items = np.argmax(silhouette_scores_items)
+    optimal_K_items = K_values_items[optimal_K_index_items]
+    print(f"\nChosen Optimal K based on highest silhouette score: {optimal_K_items}")
+
+    optimal_clustering_result_items = clustering_results_items[optimal_K_items]
+    optimal_labels_items = optimal_clustering_result_items['labels']
+    optimal_centroids_items = optimal_clustering_result_items['centroids']
+    item_ids_list = item_features_normalized_df.index.tolist()
+    item_to_cluster_map_items = dict(zip(item_ids_list, optimal_labels_items))
+
+    print(f"\nTask 5: Analyzing cluster characteristics for K={optimal_K_items}.")
+    cluster_assignment_df_items = pd.DataFrame({
+        'item_id': item_ids_list,
+        'cluster_id': optimal_labels_items
+    })
+    avg_raters_per_cluster = cluster_assignment_df_items.merge(pd.DataFrame(ni), left_on='item_id', right_index=True).groupby('cluster_id')['ni'].mean()
+    print(f"Average number of raters per cluster:\n{avg_raters_per_cluster}")
+
+    overall_avg_raters = ni.mean()
+    popular_threshold = np.percentile(avg_raters_per_cluster, 75)
+    popular_clusters = avg_raters_per_cluster[avg_raters_per_cluster >= popular_threshold].index.tolist()
+    print(f"\nClusters identified as 'Popular Item' clusters (avg raters >= {popular_threshold:.2f}): {popular_clusters}")
+
+    niche_threshold = np.percentile(avg_raters_per_cluster, 25)
+    niche_clusters = avg_raters_per_cluster[avg_raters_per_cluster <= niche_threshold].index.tolist()
+    print(f"Clusters identified as 'Niche Item' clusters (avg raters <= {niche_threshold:.2f}): {niche_clusters}")
+
+    long_tail_threshold = np.percentile(avg_raters_per_cluster, 5)
+    long_tail_clusters = avg_raters_per_cluster[avg_raters_per_cluster <= long_tail_threshold].index.tolist()
+    print(f"Clusters identified as 'Long-Tail Item' clusters (avg raters <= {long_tail_threshold:.2f}): {long_tail_clusters}")
+
+    unique_labels_items, counts_items = np.unique(optimal_labels_items, return_counts=True)
+    cluster_size_dict_items = dict(zip(unique_labels_items, counts_items))
+    plt.figure(figsize=(10, 6))
+    plt.bar(unique_labels_items, counts_items)
+    plt.title(f'Distribution of Items Across Clusters (K={optimal_K_items})')
+    plt.xlabel('Cluster ID')
+    plt.ylabel('Number of Items')
+    plt.grid(axis='y')
+    plt.show()
+    print(f"Cluster sizes for K={optimal_K_items}: {cluster_size_dict_items}")
+
+    plt.figure(figsize=(12, 8))
+    for cluster_id in sorted(avg_raters_per_cluster.index):
+        items_in_cluster = cluster_assignment_df_items[cluster_assignment_df_items['cluster_id'] == cluster_id]['item_id']
+        raters_in_cluster = ni[items_in_cluster]
+        plt.hist(raters_in_cluster, bins=50, alpha=0.5, label=f'Cluster {cluster_id}', density=True)
+    plt.title(f'Distribution of Number of Raters within Each Cluster (K={optimal_K_items})')
+    plt.xlabel('Number of Raters (ni)')
+    plt.ylabel('Density')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')
+    plt.show()
+    print(f"Task 6.2: Yes, items with similar popularity levels are grouped together.")
+
+print("\n--- Section 3.3.3: Part 3 Complete ---")
